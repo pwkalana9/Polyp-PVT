@@ -1,0 +1,23 @@
+PolypPVTBackbone
+
+Runs the original PVT → CFM → CIM stack (we drop the SAM mask head).
+
+Returns a dictionary of 4 feature maps at strides {4,8,16,32}.
+
+Exposes out_channels so MaskRCNN knows the feature dimensionality.
+
+MaskRCNN setup
+
+We configure an AnchorGenerator appropriate for polyp sizes.
+
+We use MultiScaleRoIAlign on the four feature maps for both box and mask heads.
+
+num_classes=2 (background + polyp).
+
+Training & Inference
+
+In train mode, model(images, targets) returns a dict of losses you sum and backprop.
+
+In eval mode, model(images) returns detection results with bounding boxes, labels, and per-instance masks.
+
+You can now plug this module into your training script, point it at your instance‐segmentation dataset (each example with boxes + masks), and train end-to-end.
