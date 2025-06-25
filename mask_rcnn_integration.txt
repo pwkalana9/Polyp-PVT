@@ -21,3 +21,14 @@ In train mode, model(images, targets) returns a dict of losses you sum and backp
 In eval mode, model(images) returns detection results with bounding boxes, labels, and per-instance masks.
 
 You can now plug this module into your training script, point it at your instance‐segmentation dataset (each example with boxes + masks), and train end-to-end.
+--------------------------------
+
+No more CIM class import—we import its two parts (ChannelAttention, SpatialAttention) directly.
+
+We construct a parallel CIM branch alongside CFM, applying CA → SA to each PVT feature map before fusion.
+
+We then add (+) the CFM and CIM outputs at each scale, and feed the result into SAM.
+
+Finally, we return a dict of four fused feature maps for MaskRCNN’s RoI heads.
+
+You can now train with your instance‐segmentation dataset (boxes + masks) exactly as shown previously.
