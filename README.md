@@ -104,5 +104,40 @@ We are very grateful for these excellent works [PraNet](https://github.com/DengP
 ## 7. FAQ:
 If you want to improve the usability or any piece of advice, please feel free to contact me directly (bodong.cv@gmail.com).
 
+Feature map shapes (for input size H×W)
+Let channel=32 and assume H,W divisible by 32:
+
+Level	Source tensor	Shape	Stride
+P2	trans1(cim)	[B,32, H/4, W/4]	4
+P3	sam_feat	[B,32, H/8, W/8]	8
+P4	trans3(x3)	[B,32, H/16, W/16]	16
+P5	trans4(x4)	[B,32, H/32, W/32]	32
+
+And intermediate dims:
+
+PVT stages:
+
+x1: [B,64, H/4, W/4]
+
+x2: [B,128,H/8, W/8]
+
+x3: [B,320,H/16, W/16]
+
+x4: [B,512,H/32, W/32] 
+github.com
+
+Translayers (all →32 channels):
+
+trans1: 64→32, trans2:128→32, trans3:320→32, trans4:512→32 
+github.com
+
+CFM outputs cfm_feat: [B,32,H/8,W/8] 
+github.com
+
+SAM outputs sam_feat: [B,32,H/8,W/8] 
+github.com
+
+With these exact mappings, Mask R-CNN’s RPN and RoI heads will see precisely the four scales they expect, all in the same out_channels dimension.
+
 ## 8. License
 The source code is free for research and education use only. Any comercial use should get formal permission first.
