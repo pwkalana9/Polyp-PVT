@@ -1,0 +1,157 @@
+If your Mask-R CNN’s total loss is steadily increasing rather than decreasing, it usually points to one (or more) of the following issues in the data pipeline, model configuration, or optimization setup. Here’s a systematic checklist to help you debug:
+
+
+---
+
+1. Data & Annotation Problems
+
+1. Invalid bounding-boxes or masks
+
+Boxes with zero or negative area (xmax≤xmin or ymax≤ymin) will break the box-regression loss.
+
+Masks that are all zeros (or don’t align with the box) give no positive examples for the mask head.
+
+Verify for a random batch that every target["boxes"][i] tightly encloses the corresponding target["masks"][i].
+
+
+
+2. Coordinate scaling / image size mismatches
+
+If your images are resized (e.g. to a fixed short side) but your boxes/masks remain at original resolution, losses become nonsensical.
+
+Ensure that any transforms you apply to the image are also applied to boxes and masks in exactly the same way (e.g. use torchvision’s GeneralizedRCNNTransform).
+
+
+
+3. area and iscrowd fields
+
+Mask R-CNN’s RPN-to-RoI sampler uses area to filter small boxes. Make sure area = (xmax–xmin)*(ymax–ymin) is correct.
+
+If you mark something as iscrowd=1, it’s handled differently (no mask loss). Usually set iscrowd=0 for simple instance data.
+
+
+
+
+
+---
+
+2. Model & Backbone Configuration
+
+1. Backbone weight initialization
+
+If you loaded a PVT backbone but didn’t correctly load_state_dict or accidentally left it uninitialized, the network could start in a random regime that’s hard to train.
+
+Print a few backbone weights before/after loading to confirm they’re nonzero and roughly in expected ranges.
+
+
+
+2. Learning rate too high
+
+Transformer-style backbones (like PVT) are sensitive to LR. If you used the same LR as for a ResNet-FPN, it may be blowing up.
+
+Try reducing the base LR by an order of magnitude (e.g. from 1e-3 → 1e-4 or 1e-5) and/or add a short warm-up phase.
+
+
+
+3. Frozen vs. unfrozen backbone
+
+If you froze the PVT layers but left the CFM/CIM/SAM and heads unfrozen, your gradients might have nowhere to go.
+
+Conversely, if you accidentally froze the heads, your backbone can’t learn.
+
+Check for n,p in model.backbone.named_parameters(): print(n, p.requires_grad).
+
+
+
+
+
+---
+
+3. Anchor & Sampling Settings
+
+1. Anchor sizes/aspect ratios mismatch
+
+If your polyps are tiny or very elongated, the default anchor scales (32,64,128,256) or ratios (0.5,1,2) may yield almost no positive RPN proposals, starving the box head.
+
+Visualize the RPN proposals on a few training images to see whether any anchors match the ground-truth boxes.
+
+Customise AnchorGenerator(sizes=[…], aspect_ratios=[…]) to better fit your object sizes.
+
+
+
+2. Batch size and positive/negative ratio
+
+By default, Mask-RCNN samples up to 512 RoIs per image with a 1:3 positive:negative ratio. If you have very few positives, your box head sees mostly negatives and may collapse.
+
+Consider lowering batch_size_per_image or adjusting positive_fraction via:
+
+model.roi_heads.batch_size_per_image = 256
+model.roi_heads.positive_fraction = 0.5
+
+
+
+
+
+---
+
+4. Optimization & Logging
+
+1. Gradient explosions
+
+Track the norm of your gradients. If they shoot up, clip them:
+
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+
+
+
+2. Loss component magnitudes
+
+Log each loss term separately (loss_classifier, loss_box_reg, loss_mask, loss_rpn_cls, loss_rpn_bbox) to see which one is diverging.
+
+Sometimes the RPN box regression loss dominates; you can down‐weight it:
+
+loss = (loss_dict['loss_classifier']
+        + loss_dict['loss_box_reg']
+        + loss_dict['loss_mask']
+        + 0.5 * loss_dict['loss_rpn_bbox']
+        + loss_dict['loss_rpn_cls'])
+
+
+
+3. Optimizer choice & weight decay
+
+For transformer-style backbones, AdamW is often better than SGD.
+
+If you’re using SGD, start with a small momentum (0.9) and tiny weight decay (e.g. 1e-4).
+
+
+
+
+
+---
+
+5. Quick Sanity Checks
+
+Forward‐only test: run a single batch in eval() mode—no gradients—and confirm all losses are finite and reasonable:
+
+model.eval()
+with torch.no_grad():
+    loss_dict = model(images, targets)
+    print({k:float(v) for k,v in loss_dict.items()})
+
+Zero‐loss test: feed the network its own predictions as “ground truth” to verify the loss can go to zero:
+
+model.eval()
+outputs = model(images)  # boxes+masks
+pseudo_targets = [{'boxes':o['boxes'], 'labels':o['labels'], 'masks':o['masks']} for o in outputs]
+loss_dict = model(images, pseudo_targets)
+# ideally all losses ≈ 0
+
+Overfit test: try to overfit on 2–4 images (no data augmentation). If the loss won’t fall on that tiny set, something is fundamentally broken.
+
+
+
+---
+
+By systematically walking through these steps—verifying your data, tuning your anchors & sampling, adjusting your learning rate/optimizer, and checking that each loss term behaves as expected—you should be able to pinpoint why your total loss is climbing rather than falling.
+
