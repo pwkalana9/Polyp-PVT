@@ -2,6 +2,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import ToTensor
 from torchvision.ops.feature_pyramid_network import FeaturePyramidNetwork
@@ -182,9 +183,9 @@ def postprocess_detections_4d(class_logits, box_deltas, mask_logits, proposals, 
     return results
 
 # -----------------------------------------------------------------------------
-# 7) Simplified Dataset for 4D Radar
+# 7) Simplified Dataset for 4D dataset
 # -----------------------------------------------------------------------------
-class Radar4DDataset(Dataset):
+class 4DDataset(Dataset):
     def __init__(self, data_dir, transforms=None):
         self.files = sorted([f for f in os.listdir(data_dir) if f.endswith('.npy')])
         self.data_dir = data_dir
@@ -255,9 +256,120 @@ def train_one_epoch(model, optimizer, loader, device):
                   ", ".join([f"{k}={v.item():.4f}" for k,v in loss_dict.items()]))
 
 # -----------------------------------------------------------------------------
+# 7) Synthetic Dataset for 4D 
+# -----------------------------------------------------------------------------
+class Synthetic4DDataset(Dataset):
+    """
+    Generates synthetic cubes of shape [T, D, H, W].
+    """
+    def __init__(self,
+                 num_samples: int,
+                 cube_size=(20, 16, 64, 64),  # (T, D, H, W)
+                 num_targets_range=(1, 4),
+                 traj_types=('linear','circular','zigzag'),
+                 doppler_types=('constant','accelerating','decelerating','mixed'),
+                 transforms=None):
+        self.num_samples = num_samples
+        self.T, self.D, self.H, self.W = cube_size
+        self.min_targs, self.max_targs = num_targets_range
+        self.traj_types = traj_types
+        self.doppler_types = doppler_types
+        self.transforms = transforms
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        cube = np.zeros((self.T, self.D, self.H, self.W), dtype=np.float32)
+        annotations = []
+        n_targs = np.random.randint(self.min_targs, self.max_targs+1)
+        # build trajectories
+        trajectories = []
+        for _ in range(n_targs):
+            # spatial
+            st = np.random.choice(self.traj_types)
+            if st=='linear':
+                y0,x0 = np.random.uniform(0,self.H), np.random.uniform(0,self.W)
+                vy,vx = np.random.uniform(-1,1), np.random.uniform(-1,1)
+                spat = ('linear',(y0,x0,vy,vx))
+            elif st=='circular':
+                cy,cx = np.random.uniform(self.H/4,3*self.H/4), np.random.uniform(self.W/4,3*self.W/4)
+                r,omega,theta0 = np.random.uniform(min(self.H,self.W)/8, min(self.H,self.W)/4),
+                                 np.random.uniform(-0.2,0.2), np.random.uniform(0,2*np.pi)
+                spat = ('circular',(cy,cx,r,omega,theta0))
+            else:
+                y0,x0 = np.random.uniform(0,self.H), np.random.uniform(0,self.W)
+                vy,vx = np.random.uniform(-1,1), np.random.uniform(-1,1)
+                period = np.random.randint(5,self.T)
+                spat = ('zigzag',(y0,x0,vy,vx,period))
+            # doppler
+            dt = np.random.choice(self.doppler_types)
+            if dt=='constant':
+                d0 = np.random.randint(0,self.D)
+                dop = ('constant',(d0,))
+            elif dt=='accelerating':
+                d0 = np.random.uniform(0,self.D)
+                dv0 = np.random.uniform(0.1,1.0)
+                a = np.random.uniform(0.01,0.1)
+                dop = ('accelerating',(d0,dv0,a))
+            elif dt=='decelerating':
+                d0 = np.random.uniform(0,self.D)
+                dv0 = np.random.uniform(0.1,1.0)
+                a = -np.random.uniform(0.01,0.1)
+                dop = ('accelerating',(d0,dv0,a))
+            else:  # mixed
+                d0 = np.random.uniform(0,self.D)
+                dpeak = np.random.uniform(0,self.D)
+                t_mid = np.random.randint(self.T//4, 3*self.T//4)
+                dop = ('mixed',(d0,dpeak,t_mid))
+            trajectories.append((spat, dop))
+        # render per frame
+        for t in range(self.T):
+            boxes, masks = [], []
+            for spat, dop in trajectories:
+                # spatial coords
+                st, sp = spat
+                if st=='linear': y0,x0,vy,vx=sp; y,x=y0+vy*t, x0+vx*t
+                elif st=='circular': cy,cx,r,omega,theta0=sp; theta=theta0+omega*t; y,x=cy+r*np.sin(theta),cx+r*np.cos(theta)
+                else: y0,x0,vy,vx,period=sp; sign=1 if (t//period)%2==0 else -1; y,x=y0+vy*t*sign,x0+vx*t*sign
+                y,x = np.clip(y,0,self.H-1), np.clip(x,0,self.W-1)
+                # doppler bin
+                dt, dp = dop
+                if dt=='constant': d = int(dp[0])
+                elif dt in ('accelerating','decelerating'): d0, dv0, a = dp; d = int(np.clip(d0 + dv0*t + 0.5*a*t*t, 0, self.D-1))
+                else: # mixed
+                    d0,dpeak,t_mid = dp
+                    if t<=t_mid: d = int(np.clip(d0 + (dpeak-d0)*t/t_mid,0,self.D-1))
+                    else: d = int(np.clip(dpeak + (d0-dpeak)*(t-t_mid)/(self.T-1-t_mid),0,self.D-1))
+                # blob
+                r_mask = np.random.randint(1,5)
+                yy, xx = np.ogrid[:self.H, :self.W]
+                mask2d = ((yy-y)**2 + (xx-x)**2) <= r_mask**2
+                cube[t,d][mask2d]=1.0
+                mask_full = np.zeros((self.D,self.H,self.W),dtype=np.uint8); mask_full[d][mask2d]=1
+                masks.append(mask_full)
+                ys,xs = np.where(mask2d); ymin,ymax, xmin,xmax=ys.min(),ys.max(), xs.min(),xs.max()
+                boxes.append([t,d,ymin,xmin,t,d,ymax,xmax])
+            annotations.append((boxes,masks))
+        # to tensors
+        cube_tensor = torch.from_numpy(cube)
+        imgs = cube_tensor.unsqueeze(0)  # [1,T,D,H,W]
+        targets=[]
+        for boxes,masks in annotations:
+            targets.append({
+                'boxes':torch.tensor(boxes,dtype=torch.float32),
+                'labels':torch.ones(len(boxes),dtype=torch.int64),
+                'masks':torch.tensor(masks,dtype=torch.uint8)
+            })
+        if self.transforms: imgs,targets=self.transforms(imgs,targets)
+        return imgs, targets
+
+# -----------------------------------------------------------------------------
 # 10) Putting it all together
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
+    dataset = Synthetic4DDataset(100)\# loader = DataLoader(dataset, batch_size=1, collate_fn=lambda x: x[0])
+    
     # hyperparams
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     num_classes = 2
@@ -270,7 +382,7 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
     # dataset & dataloader
-    dataset = Radar4DDataset('data/radar_cubes')
+    dataset = 4DDataset('data/4d_cubes')
     loader  = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=lambda x: x[0])
 
     for epoch in range(epochs):
