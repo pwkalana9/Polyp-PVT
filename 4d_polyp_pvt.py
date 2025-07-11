@@ -2,188 +2,248 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import OrderedDict
+from torchvision.models.detection.rpn import AnchorGenerator
+from torchvision.ops.feature_pyramid_network import FeaturePyramidNetwork
 
-# -------------------------------------------------------------------
-# 1) A naive Conv4D implemented via unfold on each axis + einsum
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 1) True 4D convolution (Conv4d)
+# -----------------------------------------------------------------------------
+def _quad(x):
+    return (x,)*4 if isinstance(x, int) else tuple(x)
+
 class Conv4d(nn.Module):
     """
-    A minimal Conv4d: input shape [B, C_in, T, D, H, W],
-    weight shape [C_out, C_in, kT, kD, kH, kW].
+    A minimal Conv4d: input [B,C_in,T,D,H,W],
+    weight [C_out,C_in,kT,kD,kH,kW].
     """
-    def __init__(self, 
-                 in_channels, out_channels,
-                 kernel_size, stride=1, padding=0, bias=True):
+    def __init__(self, in_c, out_c, kernel_size, stride=1, padding=0, bias=True):
         super().__init__()
-        # allow ints or 4-tuples
         self.kT, self.kD, self.kH, self.kW = _quad(kernel_size)
         self.sT, self.sD, self.sH, self.sW = _quad(stride)
         self.pT, self.pD, self.pH, self.pW = _quad(padding)
 
-        self.weight = nn.Parameter(
-            torch.randn(out_channels, in_channels,
-                        self.kT, self.kD, self.kH, self.kW)
-        )
-        if bias:
-            self.bias = nn.Parameter(torch.zeros(out_channels))
-        else:
-            self.bias = None
+        self.weight = nn.Parameter(torch.randn(
+            out_c, in_c, self.kT, self.kD, self.kH, self.kW))
+        self.bias = nn.Parameter(torch.zeros(out_c)) if bias else None
 
     def forward(self, x):
-        # x: [B,C_in,T,D,H,W]
-        B, C, T, D, H, W = x.shape
-        # pad
+        # x: [B,C,T,D,H,W]
+        B,C,T,D,H,W = x.shape
+        # pad in (W,H,D,T) order for F.pad
         x = F.pad(x, (self.pW,)*2 + (self.pH,)*2 + (self.pD,)*2 + (self.pT,)*2)
-        # unfold each dim
-        # after unfold_T: [B,C, outT, kT, D_pad, H_pad, W_pad]
-        x = x.unfold(2, self.kT, self.sT)
-        # unfold D
+        # unfold each spatial dim
+        x = x.unfold(2, self.kT, self.sT)  # -> [B,C,outT,kT,D',H',W']
         x = x.unfold(3, self.kD, self.sD)
-        # unfold H
         x = x.unfold(4, self.kH, self.sH)
-        # unfold W
         x = x.unfold(5, self.kW, self.sW)
-        # now x.shape = [B, C, outT, outD, outH, outW, kT, kD, kH, kW]
-        B, C, outT, outD, outH, outW, kT, kD, kH, kW = x.shape
-        # flatten the kernel dims into one
-        x = x.contiguous().view(B, C, outT, outD, outH, outW, -1)  # C * kT*kD*kH*kW
-        # reshape for matmul
-        x = x.permute(0, 2, 3, 4, 5, 1, 6)  # [B, outT, outD, outH, outW, C, K]
-        x = x.reshape(-1, C * kT * kD * kH * kW)                  # [B*outT*outD*outH*outW, C*K]
-
-        w = self.weight.view(self.weight.size(0), -1)            # [C_out, C*K]
-        out = x @ w.t()                                           # [B*... , C_out]
+        # collapse kernel dims
+        B,C,oT,oD,oH,oW,kT,kD,kH,kW = x.shape
+        x = x.contiguous().view(B, C, oT, oD, oH, oW, -1)    # C * kT*kD*kH*kW
+        x = x.permute(0,2,3,4,5,1,6).reshape(-1, C * kT*kD*kH*kW)
+        w = self.weight.view(self.weight.size(0), -1)
+        out = x @ w.t()
         if self.bias is not None:
-            out = out + self.bias
-
-        # reshape back
-        out = out.view(B, outT, outD, outH, outW, -1)            # [B, T', D', H', W', C_out]
-        out = out.permute(0, 5, 1, 2, 3, 4).contiguous()         # [B, C_out, T', D', H', W']
+            out += self.bias
+        # reshape back to [B,oC,oT,oD,oH,oW]
+        oC = self.weight.size(0)
+        out = out.view(B, oT, oD, oH, oW, oC).permute(0,5,1,2,3,4)
         return out
 
-def _quad(x):
-    if isinstance(x, int):
-        return (x,)*4
-    assert len(x) == 4
-    return x
-
-# -------------------------------------------------------------------
-# 2) A toy “4D‐PVT” backbone replacing 2D patch‐embed with Conv4d
-# -------------------------------------------------------------------
-class PatchEmbed4D(nn.Module):
+# -----------------------------------------------------------------------------
+# 2) 4D RoI Align (crop + adaptive pooling)
+# -----------------------------------------------------------------------------
+class ROIAlign4D(nn.Module):
     """
-    4D patch embed: reduces (T,D,H,W) → tokens + optional pooling
+    Crops each 4D box (t1,d1,h1,w1,t2,d2,h2,w2) and adaptively pools to (Ot,Od,Oh,Ow).
+    boxes list: one Tensor[K,8] per image in the batch.
     """
-    def __init__(self, in_chans, embed_dim,
-                 kernel_size=(2,2,4,4), stride=(2,2,4,4), padding=(0,0,1,1)):
+    def __init__(self, output_size):
         super().__init__()
-        self.proj = Conv4d(in_chans, embed_dim,
-                           kernel_size=kernel_size,
-                           stride=stride,
-                           padding=padding)
-        self.norm = nn.LayerNorm(embed_dim)
+        self.output_size = output_size  # tuple of 4 ints
+
+    def forward(self, features, boxes_list):
+        # features: [B,C,T,D,H,W]
+        # boxes_list: list of length B, each [K,8] in feature-map coordinates
+        B, C, T, D, H, W = features.shape
+        Ot, Od, Oh, Ow = self.output_size
+        pooled = []
+        for b, boxes in enumerate(boxes_list):
+            f = features[b:b+1]  # [1,C,T,D,H,W]
+            for box in boxes:
+                t1,d1,h1,w1,t2,d2,h2,w2 = box.round().long().tolist()
+                region = f[..., t1:t2, d1:d2, h1:h2, w1:w2]  # [1,C,dt,dd,dh,dw]
+                # adaptive pool along last 4 dims
+                # 1) pool (d,h,w) → (Od,Oh,Ow)
+                region = F.adaptive_max_pool3d(
+                    region.flatten(2),  # merge T into batch dim
+                    (Od,Oh,Ow)
+                ).view(1, C, T, Od, Oh, Ow)
+                # 2) pool T → Ot
+                if Ot != T:
+                    region = F.adaptive_max_pool3d(
+                        region.permute(0,1,3,4,5,2).reshape(1, C*Od*Oh*Ow, T,1,1),
+                        (Ot,1,1)
+                    ).reshape(1, C, Ot, Od, Oh, Ow)
+                pooled.append(region)
+        if not pooled:
+            return torch.zeros(0, C, Ot, Od, Oh, Ow, device=features.device)
+        return torch.cat(pooled, dim=0)
+
+# -----------------------------------------------------------------------------
+# 3) 4D Box Head & Predictor
+# -----------------------------------------------------------------------------
+class BoxHead4D(nn.Module):
+    """
+    Two‐layer MLP on flattened pooled 4D features.
+    """
+    def __init__(self, in_channels, Ot, Od, Oh, Ow, representation_size=256):
+        super().__init__()
+        dim = in_channels * Ot * Od * Oh * Ow
+        self.fc1 = nn.Linear(dim, representation_size)
+        self.fc2 = nn.Linear(representation_size, representation_size)
+        self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        # x: [B, C, T, D, H, W]
-        x = self.proj(x)  # [B, E, T', D', H', W']
-        B, E, T, D, H, W = x.shape
-        # flatten spatio-temporal dims to tokens
-        x = x.flatten(2).transpose(1,2)  # [B, N, E], N=T'*D'*H'*W'
-        x = self.norm(x)
-        # (optionally) reshape back to 4D feature map
-        x = x.transpose(1,2).view(B, E, T, D, H, W)
-        return x
+        # x: [N, C, Ot, Od, Oh, Ow]
+        x = x.flatten(1)            # [N, C*Ot*Od*Oh*Ow]
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        return x  # [N, representation_size]
 
-class Simple4DPVTBackbone(nn.Module):
+class BoxPredictor4D(nn.Module):
     """
-    A stub: one patch-embed + one Conv4d block + simple attention.
+    Predicts class logits and 8-D box deltas per class.
     """
-    def __init__(self, in_chans=1, embed_dim=32):
+    def __init__(self, representation_size, num_classes):
         super().__init__()
-        self.patch = PatchEmbed4D(in_chans, embed_dim)
-        # a single 4D convolutional “block”
-        self.conv4d = Conv4d(embed_dim, embed_dim,
-                             kernel_size=(3,3,3,3),
-                             stride=1, padding=1)
-        # simple channel‐wise attention across 4D features
-        self.attn = nn.Sequential(
-            nn.AdaptiveAvgPool3d((None,1,1)),   # avg over D,H,W but keep T
-            nn.Conv1d(embed_dim, embed_dim, 1),
-            nn.Sigmoid()
-        )
-        self.out_channels = embed_dim
+        self.cls_score = nn.Linear(representation_size, num_classes)
+        # 8 coords: (t1_offset,d1_offset,h1_offset,w1_offset, t2_,d2_,h2_,w2_)
+        self.bbox_pred = nn.Linear(representation_size, num_classes * 8)
 
     def forward(self, x):
-        # x: [B, C_in, T, D, H, W]
-        x = self.patch(x)    # [B, E, T',D',H',W']
-        f = self.conv4d(x)   # [B, E, T',D',H',W']
-        # channel‐wise scale
-        # collapse spatial dims to feed into Conv1d
-        B, E, T, D, H, W = f.shape
-        ctx = f.mean(dim=[3,4,5])            # [B, E, T]
-        ctx = self.attn(ctx)                 # [B, E, T]
-        ctx = ctx.view(B, E, T, 1,1,1)
-        f = f * ctx
-        return f
+        scores = self.cls_score(x)            # [N, num_classes]
+        deltas = self.bbox_pred(x)            # [N, num_classes*8]
+        return scores, deltas
 
-# -------------------------------------------------------------------
-# 3) A stub “4D Mask R-CNN” API binding the 4D backbone
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 4) 4D Mask Head & Predictor
+# -----------------------------------------------------------------------------
+class MaskHead4D(nn.Module):
+    """
+    A two‐layer 4D conv head.
+    """
+    def __init__(self, in_channels, hidden_dim=128):
+        super().__init__()
+        self.conv1 = Conv4d(in_channels, hidden_dim, kernel_size=3, padding=1)
+        self.conv2 = Conv4d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
+        self.relu  = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        return x  # [N, hidden_dim, Ot, Od, Oh, Ow]
+
+class MaskPredictor4D(nn.Module):
+    """
+    Projects to per‐class mask logits at the pooled resolution.
+    """
+    def __init__(self, in_channels, num_classes):
+        super().__init__()
+        self.mask_fcn = Conv4d(in_channels, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        return self.mask_fcn(x)  # [N, num_classes, Ot, Od, Oh, Ow]
+
+# -----------------------------------------------------------------------------
+# 5) 4D RoI Heads tying it all together
+# -----------------------------------------------------------------------------
+class RoIHeads4D(nn.Module):
+    def __init__(self,
+                 out_channels,            # C
+                 box_output_size,         # (Ot,Od,Oh,Ow)
+                 mask_output_size,        # (Ot,Od,Oh,Ow)
+                 num_classes):
+        super().__init__()
+        OtB,OdB,OhB,OwB = box_output_size
+        OtM,OdM,OhM,OwM = mask_output_size
+
+        self.box_roi_pool = ROIAlign4D(box_output_size)
+        self.box_head     = BoxHead4D(out_channels, *box_output_size)
+        self.box_predictor = BoxPredictor4D(self.box_head.fc2.out_features, num_classes)
+
+        self.mask_roi_pool = ROIAlign4D(mask_output_size)
+        self.mask_head     = MaskHead4D(out_channels)
+        self.mask_predictor= MaskPredictor4D(128, num_classes)
+
+    def forward(self, features, proposals, image_shapes, targets=None):
+        """
+        features: [B,C,T,D,H,W]
+        proposals: list of length B, each Tensor[K,8] with boxes in feature-map coords
+        """
+        # 1) Box branch
+        pooled_boxes = self.box_roi_pool(features, proposals)      # [N,C,OtB,OdB,OhB,OwB]
+        box_feats    = self.box_head(pooled_boxes)                # [N,rep]
+        class_logits, box_deltas = self.box_predictor(box_feats)  # [N,cls], [N,cls*8]
+
+        # Compute box losses or detections here (omitted for brevity)...
+        # 2) Mask branch (only on positive RoIs in training/inference)
+        pooled_masks = self.mask_roi_pool(features, proposals)     # [N,C,OtM,OdM,OhM,OwM]
+        mask_feats   = self.mask_head(pooled_masks)               # [N,128,OtM,OdM,OhM,OwM]
+        mask_logits  = self.mask_predictor(mask_feats)            # [N,cls,OtM,OdM,OhM,OwM]
+
+        # Return raw outputs; a full implementation would compute:
+        #   - classification + box regression losses
+        #   - mask loss
+        #   - final detections & masks in 4D
+        return {
+            "class_logits": class_logits,
+            "box_deltas": box_deltas,
+            "mask_logits": mask_logits
+        }
+
+# -----------------------------------------------------------------------------
+# 6) Full 4D MaskRCNN
+# -----------------------------------------------------------------------------
 class MaskRCNN4D(nn.Module):
-    """
-    Sketch: takes a 4D backbone, then 4D→2D flatten & 2D Mask RCNN head.
-    (Full 4D ROIAlign is out of scope here.)
-    """
-    def __init__(self, backbone4d, num_classes=2):
+    def __init__(self,
+                 backbone4d,            # e.g. your Polyp-PVT 4D encoder + FPN
+                 num_classes,
+                 anchor_sizes=((8,), (16,), (32,), (64,)),
+                 aspect_ratios=((1.0,),)*4,
+                 box_output_size=(2,2,7,7),
+                 mask_output_size=(2,2,14,14)):
         super().__init__()
-        self.backbone4d = backbone4d
-        # after backbone → collapse T,D dims by pooling to get 2D maps
-        self.pool4d = nn.AdaptiveAvgPool3d((None,1,1))  
-        # now use a standard 2D MaskRCNN head
-        from torchvision.models.detection import MaskRCNN
-        from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-        from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
-        # dummy 2D backbone: will accept [B, C, H, W]
-        # we wrap it so its forward(x) → feature dict for MaskRCNN
-        class _FakeBack2d(nn.Module):
-            def __init__(self, in_channels):
-                super().__init__()
-                self.out_channels = in_channels
-            def forward(self, x):
-                return OrderedDict([("0", x)])
-        fake2d = _FakeBack2d(backbone4d.out_channels)
-        self.maskrcnn2d = MaskRCNN(fake2d, num_classes=num_classes)
-        # replace predictors (same as before)
-        in_feat = self.maskrcnn2d.roi_heads.box_predictor.cls_score.in_features
-        self.maskrcnn2d.roi_heads.box_predictor = FastRCNNPredictor(in_feat, num_classes)
-        in_feat_mask = self.maskrcnn2d.roi_heads.mask_predictor.conv5_mask.in_channels
-        self.maskrcnn2d.roi_heads.mask_predictor = MaskRCNNPredictor(in_feat_mask, 256, num_classes)
+        # 1) backbone + FPN
+        self.body = backbone4d
+        in_channels_list = [backbone4d.out_channels]*4
+        self.fpn = FeaturePyramidNetwork(in_channels_list, backbone4d.out_channels)
+        self.out_channels = backbone4d.out_channels
 
-    def forward(self, imgs, targets=None):
-        # imgs: list[Tensors] each of shape [B,C,T,D,H,W]
-        # for simplicity assume batch of 1
-        x4d = imgs[0]                      # [B,C,T,D,H,W]
-        f4d = self.backbone4d(x4d)         # [B,E,T',D',H',W']
-        # collapse T',D' via pooling → get [B,E,H',W']
-        f2d = self.pool4d(f4d).squeeze(-1).squeeze(-1)  # [B,E,H',W']
-        # feed into 2D Mask R-CNN
-        return self.maskrcnn2d([f2d], targets)
+        # 2) RPN
+        self.anchor_generator = AnchorGenerator(sizes=anchor_sizes,
+                                                aspect_ratios=aspect_ratios)
+        # ... (build your RPN here, omitted for brevity)
 
-# -------------------------------------------------------------------
-# 4) Example usage
-# -------------------------------------------------------------------
-if __name__ == "__main__":
-    # synthetic 4D radar + time input: [B=1, C=1, T=10, D=8, H=64, W=64]
-    inp = torch.randn(1,1,10,8,64,64)
-    backbone4d = Simple4DPVTBackbone(in_chans=1, embed_dim=32)
-    model4d    = MaskRCNN4D(backbone4d, num_classes=2)
+        # 3) 4D RoI Heads
+        self.roi_heads = RoIHeads4D(self.out_channels,
+                                    box_output_size,
+                                    mask_output_size,
+                                    num_classes)
 
-    # dummy target
-    tgt = [{
-      "boxes": torch.tensor([[10,10,50,50]], dtype=torch.float32),
-      "labels":torch.tensor([1],dtype=torch.int64),
-      "masks": torch.zeros((1,64,64),dtype=torch.uint8)
-    }]
-    # forward
-    losses = model4d([inp], tgt)
-    print(losses)
+    def forward(self, x, targets=None):
+        # x: list of 4D tensors [B, C_in, T, D, H, W]
+        features = self.body(x[0])               # OrderedDict of 4D maps p2..p5
+        features = self.fpn(features)            # same keys
+        # 4) RPN to generate 4D proposals (omitted; produce list of B [K,8] tensors)
+        proposals = rpn_4d(self.anchor_generator, features, x)  # you’d implement this
+        # 5) RoI heads
+        return self.roi_heads(features_to_tensor(features),
+                              proposals, image_shapes=None, targets=targets)
+
+# -----------------------------------------------------------------------------
+# NOTE
+#  - You’ll need to implement `rpn_4d` to produce 4D box proposals.
+#  - `features_to_tensor` should stack your OrderedDict levels into one 4D tensor
+#    or pass them separately to `ROIAlign4D`.
+#  - Loss/detection post-processing are left as an exercise.
+# -----------------------------------------------------------------------------
