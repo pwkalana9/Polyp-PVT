@@ -1,12 +1,14 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision.transforms import ToTensor
 from torchvision.ops.feature_pyramid_network import FeaturePyramidNetwork
 from collections import OrderedDict
-from maskrcnn4d_rpn_postprocessing import rpn_4d, postprocess_detections_4d, RPNHead4D, AnchorGenerator4D
 
 # -----------------------------------------------------------------------------
-# 1) True 4-D Conv (from previous)
+# 1) True 4D convolution (Conv4d)
 # -----------------------------------------------------------------------------
 def _quad(x):
     return (x,)*4 if isinstance(x, int) else tuple(x)
@@ -36,21 +38,17 @@ class Conv4d(nn.Module):
         return out
 
 # -----------------------------------------------------------------------------
-# 2) 4-D Anchor Generator
+# 2) 4D Anchor Generator
 # -----------------------------------------------------------------------------
 class AnchorGenerator4D(nn.Module):
     def __init__(self, anchor_sizes, aspect_ratios):
         super().__init__()
-        # anchor_sizes: list of tuples (t_size, d_size, h_size, w_size)
-        # aspect_ratios: list of 4-tuples (t_ratio, d_ratio, h_ratio, w_ratio)
         self.sizes = anchor_sizes
         self.ratios = aspect_ratios
 
     def grid_anchors(self, feature_shape, stride):
-        # feature_shape: (T,D,H,W), stride: (sT,sD,sH,sW)
         T,D,H,W = feature_shape
         sT,sD,sH,sW = stride
-        # generate center coordinates
         t_centers = torch.arange(T, dtype=torch.float32, device=stride.device) * sT + sT/2
         d_centers = torch.arange(D, dtype=torch.float32, device=stride.device) * sD + sD/2
         h_centers = torch.arange(H, dtype=torch.float32, device=stride.device) * sH + sH/2
@@ -82,7 +80,6 @@ class RPNHead4D(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        # x: [B,C,T,D,H,W]
         t = self.relu(self.conv(x))
         logits = self.cls_logits(t)      # [B, A, T,D,H,W]
         bbox_d = self.bbox_pred(t)       # [B, A*8, T,D,H,W]
@@ -92,11 +89,9 @@ class RPNHead4D(nn.Module):
 # 4) Helpers: apply deltas, IoU, NMS in 4D
 # -----------------------------------------------------------------------------
 def apply_4d_deltas(boxes, deltas):
-    # boxes: [N,8], deltas: [N,8]
     return boxes + deltas
 
 def box_iou_4d(a, b):
-    # both: [8] -> IoU scalar
     t1,d1,h1,w1,t2,d2,h2,w2 = a; T1,D1,H1,W1,T2,D2,H2,W2 = b
     i_t1, i_d1, i_h1, i_w1 = max(t1,T1), max(d1,D1), max(h1,H1), max(w1,W1)
     i_t2, i_d2, i_h2, i_w2 = min(t2,T2), min(d2,D2), min(h2,H2), min(w2,W2)
@@ -119,10 +114,9 @@ def nms_4d(boxes, scores, iou_threshold):
     return keep
 
 # -----------------------------------------------------------------------------
-# 5) 4-D RPN & Proposal Generation
+# 5) RPN Proposal Generation
 # -----------------------------------------------------------------------------
-def rpn_4d(anchor_gen, rpn_head, features, strides, pre_nms_top_n=1000, nms_thresh=0.7):
-    # features: OrderedDict level->[B,C,T,D,H,W]
+def rpn_4d(anchor_gen, rpn_head, features, strides, pre_nms_top_n=500, nms_thresh=0.7):
     batch_size = next(iter(features.values())).shape[0]
     all_anchors = []
     obj_logits = []
@@ -133,56 +127,49 @@ def rpn_4d(anchor_gen, rpn_head, features, strides, pre_nms_top_n=1000, nms_thre
         anchors = anchors.unsqueeze(0).repeat(batch_size,1,1)  # [B,N,8]
         logits, deltas = rpn_head(feat)
         B,A,T,D,H,W = logits.shape
-        logits = logits.permute(0,1,2,3,4,5).reshape(B, -1)
-        deltas = deltas.permute(0,1,2,3,4,5).reshape(B, -1, 8)
+        logits = logits.view(B, -1)
+        deltas = deltas.view(B, -1, 8)
         all_anchors.append(anchors)
         obj_logits.append(logits)
         bbox_deltas.append(deltas)
-    all_anchors = torch.cat(all_anchors, dim=1)   # [B, M,8]
-    obj_logits  = torch.cat(obj_logits, dim=1)    # [B, M]
-    bbox_deltas = torch.cat(bbox_deltas, dim=1)   # [B, M,8]
+    all_anchors = torch.cat(all_anchors, dim=1)
+    obj_logits  = torch.cat(obj_logits, dim=1)
+    bbox_deltas = torch.cat(bbox_deltas, dim=1)
 
     proposals = []
     for b in range(batch_size):
         scores = obj_logits[b].sigmoid()
         deltas = bbox_deltas[b]
-        anchors = all_anchors[b]
-        # top-k
+        anchors= all_anchors[b]
         num_ = min(pre_nms_top_n, scores.size(0))
         topk = scores.topk(num_, sorted=True)
         idx = topk.indices
         anchors_t = anchors[idx]
         deltas_t  = deltas[idx]
         scores_t  = scores[idx]
-        # decode
         props = apply_4d_deltas(anchors_t, deltas_t)
-        # NMS
         keep = nms_4d(props, scores_t, nms_thresh)
         proposals.append(props[keep])
-    return proposals  # list of [K,8]
+    return proposals
 
 # -----------------------------------------------------------------------------
 # 6) Post-processing predictions
 # -----------------------------------------------------------------------------
 def postprocess_detections_4d(class_logits, box_deltas, mask_logits, proposals, score_thresh=0.5, iou_thresh=0.5):
-    # class_logits: [N,cls], box_deltas: [N,cls*8], mask_logits: [N,cls,Ot,Od,Oh,Ow]
     device = class_logits.device
     N, C = class_logits.shape
-    num_classes = C
     results = []
     scores = F.softmax(class_logits, -1)
-    for cls in range(1, num_classes):
+    for cls in range(1, C):
         cls_scores = scores[:, cls]
         keep = cls_scores > score_thresh
         if keep.sum()==0: continue
-        cls_boxes  = box_deltas.view(N, num_classes,8)[keep, cls]
-        cls_scores = cls_scores[keep]
-        cls_masks  = mask_logits[keep, cls]  # [M,Ot,Od,Oh,Ow]
-        # apply deltas to proposals
+        cls_boxes = box_deltas.view(N, C, 8)[keep, cls]
+        cls_scores= cls_scores[keep]
+        cls_masks = mask_logits[keep, cls]
         idxs = keep.nonzero().view(-1)
-        props = proposals[idxs]
-        boxes = apply_4d_deltas(props, cls_boxes)
-        # nms
+        props = torch.vstack([p for p in proposals])
+        boxes = apply_4d_deltas(props[idxs], cls_boxes)
         keep2 = nms_4d(boxes, cls_scores, iou_thresh)
         for i in keep2:
             mask = cls_masks[i].sigmoid() > 0.5
@@ -195,18 +182,99 @@ def postprocess_detections_4d(class_logits, box_deltas, mask_logits, proposals, 
     return results
 
 # -----------------------------------------------------------------------------
-# Usage within MaskRCNN4D:
-#   proposals = rpn_4d(anchor_gen, rpn_head, features, strides)
-#   detections = postprocess_detections_4d(...)
+# 7) Simplified Dataset for 4D Radar
 # -----------------------------------------------------------------------------
+class Radar4DDataset(Dataset):
+    def __init__(self, data_dir, transforms=None):
+        self.files = sorted([f for f in os.listdir(data_dir) if f.endswith('.npy')])
+        self.data_dir = data_dir
+        self.transforms = transforms
 
-# after building backbone + FPN:
-rpn_head = RPNHead4D(backbone.out_channels, num_anchors)
-anchor_gen = AnchorGenerator4D(sizes, ratios)
-strides = {"p2":(1,1,4,4), "p3":(1,1,8,8), "p4":(1,1,16,16), "p5":(1,1,32,32)}
+    def __len__(self): return len(self.files)
 
-# in MaskRCNN4D.forward:
-proposals = rpn_4d(anchor_gen, rpn_head, features, strides)
-raw = self.roi_heads(features, proposals, None, targets)
-detections = postprocess_detections_4d(**raw, proposals=proposals)
+    def __getitem__(self, idx):
+        arr = torch.from_numpy(np.load(os.path.join(self.data_dir, self.files[idx]))).float()
+        # arr shape: [T,D,H,W]
+        # load annotations: boxes_list and masks_list per time-step
+        ann = load_annotations(self.files[idx])
+        images, targets = [], []
+        for t in range(arr.shape[0]):
+            img = arr[t]  # [D,H,W]
+            boxes, masks = ann[t]
+            targets.append({
+                "boxes": torch.tensor(boxes, dtype=torch.float32),
+                "labels": torch.ones(len(boxes),dtype=torch.int64),
+                "masks": torch.tensor(masks, dtype=torch.uint8)
+            })
+            images.append(img)
+        # stack as [C,D,H,W] for batch=1
+        return torch.stack(images).permute(1,0,2,3), targets
 
+# -----------------------------------------------------------------------------
+# 8) Complete MaskRCNN4D Model
+# -----------------------------------------------------------------------------
+class MaskRCNN4D(nn.Module):
+    def __init__(self, backbone4d, num_classes):
+        super().__init__()
+        self.body = backbone4d
+        in_ch_list = [backbone4d.out_channels]*4
+        self.fpn = FeaturePyramidNetwork(in_ch_list, backbone4d.out_channels)
+        self.rpn_head = RPNHead4D(backbone4d.out_channels, num_anchors=len(anchor_sizes)*len(anchor_ratios))
+        self.anchor_generator = AnchorGenerator4D(anchor_sizes, anchor_ratios)
+        self.roi_heads = RoIHeads4D(backbone4d.out_channels, box_output_size, mask_output_size, num_classes)
+
+    def forward(self, x, targets=None):
+        features = self.body(x)           # OrderedDict p2..p5
+        features = self.fpn(features)
+        proposals= rpn_4d(self.anchor_generator, self.rpn_head, features, strides)
+        raw = self.roi_heads(features, proposals, None, targets)
+        if self.training:
+            return raw  # dict of losses
+        return postprocess_detections_4d(**raw, proposals=proposals)
+
+# -----------------------------------------------------------------------------
+# 9) Training Loop
+# -----------------------------------------------------------------------------
+def train_one_epoch(model, optimizer, loader, device):
+    model.train()
+    for i, (images, targets) in enumerate(loader):
+        images = images.to(device)     # [C,T,D,H,W]
+        # wrap as list
+        images = [images]
+        targets = [{k:v.to(device) for k,v in t.items()} for t in targets]
+
+        loss_dict = model(images, targets)
+        losses = sum(loss for loss in loss_dict.values())
+
+        optimizer.zero_grad()
+        losses.backward()
+        optimizer.step()
+
+        if i % 10 == 0:
+            print(f"Iter {i}: total_loss={losses.item():.4f}, " +
+                  ", ".join([f"{k}={v.item():.4f}" for k,v in loss_dict.items()]))
+
+# -----------------------------------------------------------------------------
+# 10) Putting it all together
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    # hyperparams
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    num_classes = 2
+    epochs = 10
+
+    # instantiate backbone4d (e.g. Simple4DPVTBackbone)
+    backbone4d = Simple4DPVTBackbone(in_chans=D, embed_dim=32)
+    model = MaskRCNN4D(backbone4d, num_classes).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+    # dataset & dataloader
+    dataset = Radar4DDataset('data/radar_cubes')
+    loader  = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=lambda x: x[0])
+
+    for epoch in range(epochs):
+        print(f"Epoch {epoch}")
+        train_one_epoch(model, optimizer, loader, device)
+        # optionally save checkpoint
+        torch.save(model.state_dict(), f'model_epoch_{epoch}.pth')
