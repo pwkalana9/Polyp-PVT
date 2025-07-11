@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.ops.feature_pyramid_network import FeaturePyramidNetwork
 from collections import OrderedDict
+from maskrcnn4d_rpn_postprocessing import rpn_4d, postprocess_detections_4d, RPNHead4D, AnchorGenerator4D
 
 # -----------------------------------------------------------------------------
 # 1) True 4-D Conv (from previous)
@@ -198,3 +199,14 @@ def postprocess_detections_4d(class_logits, box_deltas, mask_logits, proposals, 
 #   proposals = rpn_4d(anchor_gen, rpn_head, features, strides)
 #   detections = postprocess_detections_4d(...)
 # -----------------------------------------------------------------------------
+
+# after building backbone + FPN:
+rpn_head = RPNHead4D(backbone.out_channels, num_anchors)
+anchor_gen = AnchorGenerator4D(sizes, ratios)
+strides = {"p2":(1,1,4,4), "p3":(1,1,8,8), "p4":(1,1,16,16), "p5":(1,1,32,32)}
+
+# in MaskRCNN4D.forward:
+proposals = rpn_4d(anchor_gen, rpn_head, features, strides)
+raw = self.roi_heads(features, proposals, None, targets)
+detections = postprocess_detections_4d(**raw, proposals=proposals)
+
