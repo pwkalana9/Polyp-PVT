@@ -1,249 +1,200 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from collections import OrderedDict
-from torchvision.models.detection.rpn import AnchorGenerator
 from torchvision.ops.feature_pyramid_network import FeaturePyramidNetwork
+from collections import OrderedDict
 
 # -----------------------------------------------------------------------------
-# 1) True 4D convolution (Conv4d)
+# 1) True 4-D Conv (from previous)
 # -----------------------------------------------------------------------------
 def _quad(x):
     return (x,)*4 if isinstance(x, int) else tuple(x)
 
 class Conv4d(nn.Module):
-    """
-    A minimal Conv4d: input [B,C_in,T,D,H,W],
-    weight [C_out,C_in,kT,kD,kH,kW].
-    """
     def __init__(self, in_c, out_c, kernel_size, stride=1, padding=0, bias=True):
         super().__init__()
         self.kT, self.kD, self.kH, self.kW = _quad(kernel_size)
         self.sT, self.sD, self.sH, self.sW = _quad(stride)
         self.pT, self.pD, self.pH, self.pW = _quad(padding)
-
         self.weight = nn.Parameter(torch.randn(
             out_c, in_c, self.kT, self.kD, self.kH, self.kW))
         self.bias = nn.Parameter(torch.zeros(out_c)) if bias else None
 
     def forward(self, x):
-        # x: [B,C,T,D,H,W]
         B,C,T,D,H,W = x.shape
-        # pad in (W,H,D,T) order for F.pad
         x = F.pad(x, (self.pW,)*2 + (self.pH,)*2 + (self.pD,)*2 + (self.pT,)*2)
-        # unfold each spatial dim
-        x = x.unfold(2, self.kT, self.sT)  # -> [B,C,outT,kT,D',H',W']
-        x = x.unfold(3, self.kD, self.sD)
-        x = x.unfold(4, self.kH, self.sH)
-        x = x.unfold(5, self.kW, self.sW)
-        # collapse kernel dims
+        x = x.unfold(2, self.kT, self.sT).unfold(3, self.kD, self.sD)
+        x = x.unfold(4, self.kH, self.sH).unfold(5, self.kW, self.sW)
         B,C,oT,oD,oH,oW,kT,kD,kH,kW = x.shape
-        x = x.contiguous().view(B, C, oT, oD, oH, oW, -1)    # C * kT*kD*kH*kW
+        x = x.contiguous().view(B, C, oT, oD, oH, oW, -1)
         x = x.permute(0,2,3,4,5,1,6).reshape(-1, C * kT*kD*kH*kW)
         w = self.weight.view(self.weight.size(0), -1)
         out = x @ w.t()
-        if self.bias is not None:
-            out += self.bias
-        # reshape back to [B,oC,oT,oD,oH,oW]
-        oC = self.weight.size(0)
-        out = out.view(B, oT, oD, oH, oW, oC).permute(0,5,1,2,3,4)
+        if self.bias is not None: out += self.bias
+        out = out.view(B, oT, oD, oH, oW, -1).permute(0,5,1,2,3,4)
         return out
 
 # -----------------------------------------------------------------------------
-# 2) 4D RoI Align (crop + adaptive pooling)
+# 2) 4-D Anchor Generator
 # -----------------------------------------------------------------------------
-class ROIAlign4D(nn.Module):
-    """
-    Crops each 4D box (t1,d1,h1,w1,t2,d2,h2,w2) and adaptively pools to (Ot,Od,Oh,Ow).
-    boxes list: one Tensor[K,8] per image in the batch.
-    """
-    def __init__(self, output_size):
+class AnchorGenerator4D(nn.Module):
+    def __init__(self, anchor_sizes, aspect_ratios):
         super().__init__()
-        self.output_size = output_size  # tuple of 4 ints
+        # anchor_sizes: list of tuples (t_size, d_size, h_size, w_size)
+        # aspect_ratios: list of 4-tuples (t_ratio, d_ratio, h_ratio, w_ratio)
+        self.sizes = anchor_sizes
+        self.ratios = aspect_ratios
 
-    def forward(self, features, boxes_list):
-        # features: [B,C,T,D,H,W]
-        # boxes_list: list of length B, each [K,8] in feature-map coordinates
-        B, C, T, D, H, W = features.shape
-        Ot, Od, Oh, Ow = self.output_size
-        pooled = []
-        for b, boxes in enumerate(boxes_list):
-            f = features[b:b+1]  # [1,C,T,D,H,W]
-            for box in boxes:
-                t1,d1,h1,w1,t2,d2,h2,w2 = box.round().long().tolist()
-                region = f[..., t1:t2, d1:d2, h1:h2, w1:w2]  # [1,C,dt,dd,dh,dw]
-                # adaptive pool along last 4 dims
-                # 1) pool (d,h,w) → (Od,Oh,Ow)
-                region = F.adaptive_max_pool3d(
-                    region.flatten(2),  # merge T into batch dim
-                    (Od,Oh,Ow)
-                ).view(1, C, T, Od, Oh, Ow)
-                # 2) pool T → Ot
-                if Ot != T:
-                    region = F.adaptive_max_pool3d(
-                        region.permute(0,1,3,4,5,2).reshape(1, C*Od*Oh*Ow, T,1,1),
-                        (Ot,1,1)
-                    ).reshape(1, C, Ot, Od, Oh, Ow)
-                pooled.append(region)
-        if not pooled:
-            return torch.zeros(0, C, Ot, Od, Oh, Ow, device=features.device)
-        return torch.cat(pooled, dim=0)
+    def grid_anchors(self, feature_shape, stride):
+        # feature_shape: (T,D,H,W), stride: (sT,sD,sH,sW)
+        T,D,H,W = feature_shape
+        sT,sD,sH,sW = stride
+        # generate center coordinates
+        t_centers = torch.arange(T, dtype=torch.float32, device=stride.device) * sT + sT/2
+        d_centers = torch.arange(D, dtype=torch.float32, device=stride.device) * sD + sD/2
+        h_centers = torch.arange(H, dtype=torch.float32, device=stride.device) * sH + sH/2
+        w_centers = torch.arange(W, dtype=torch.float32, device=stride.device) * sW + sW/2
+        grid = torch.meshgrid(t_centers, d_centers, h_centers, w_centers, indexing='ij')
+        tc, dc, hc, wc = [g.reshape(-1) for g in grid]
+        anchors = []
+        for size in self.sizes:
+            t_size, d_size, h_size, w_size = size
+            for ratio in self.ratios:
+                rt, rd, rh, rw = ratio
+                anchors.append(torch.stack([
+                    tc - t_size*rt/2, dc - d_size*rd/2,
+                    hc - h_size*rh/2, wc - w_size*rw/2,
+                    tc + t_size*rt/2, dc + d_size*rd/2,
+                    hc + h_size*rh/2, wc + w_size*rw/2
+                ], dim=1))
+        return torch.cat(anchors, dim=0)
 
 # -----------------------------------------------------------------------------
-# 3) 4D Box Head & Predictor
+# 3) RPN Head 4-D
 # -----------------------------------------------------------------------------
-class BoxHead4D(nn.Module):
-    """
-    Two‐layer MLP on flattened pooled 4D features.
-    """
-    def __init__(self, in_channels, Ot, Od, Oh, Ow, representation_size=256):
+class RPNHead4D(nn.Module):
+    def __init__(self, in_channels, num_anchors):
         super().__init__()
-        dim = in_channels * Ot * Od * Oh * Ow
-        self.fc1 = nn.Linear(dim, representation_size)
-        self.fc2 = nn.Linear(representation_size, representation_size)
+        self.conv = Conv4d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.cls_logits = Conv4d(in_channels, num_anchors, kernel_size=1)
+        self.bbox_pred  = Conv4d(in_channels, num_anchors*8, kernel_size=1)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        # x: [N, C, Ot, Od, Oh, Ow]
-        x = x.flatten(1)            # [N, C*Ot*Od*Oh*Ow]
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))
-        return x  # [N, representation_size]
-
-class BoxPredictor4D(nn.Module):
-    """
-    Predicts class logits and 8-D box deltas per class.
-    """
-    def __init__(self, representation_size, num_classes):
-        super().__init__()
-        self.cls_score = nn.Linear(representation_size, num_classes)
-        # 8 coords: (t1_offset,d1_offset,h1_offset,w1_offset, t2_,d2_,h2_,w2_)
-        self.bbox_pred = nn.Linear(representation_size, num_classes * 8)
-
-    def forward(self, x):
-        scores = self.cls_score(x)            # [N, num_classes]
-        deltas = self.bbox_pred(x)            # [N, num_classes*8]
-        return scores, deltas
+        # x: [B,C,T,D,H,W]
+        t = self.relu(self.conv(x))
+        logits = self.cls_logits(t)      # [B, A, T,D,H,W]
+        bbox_d = self.bbox_pred(t)       # [B, A*8, T,D,H,W]
+        return logits, bbox_d
 
 # -----------------------------------------------------------------------------
-# 4) 4D Mask Head & Predictor
+# 4) Helpers: apply deltas, IoU, NMS in 4D
 # -----------------------------------------------------------------------------
-class MaskHead4D(nn.Module):
-    """
-    A two‐layer 4D conv head.
-    """
-    def __init__(self, in_channels, hidden_dim=128):
-        super().__init__()
-        self.conv1 = Conv4d(in_channels, hidden_dim, kernel_size=3, padding=1)
-        self.conv2 = Conv4d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
-        self.relu  = nn.ReLU(inplace=True)
+def apply_4d_deltas(boxes, deltas):
+    # boxes: [N,8], deltas: [N,8]
+    return boxes + deltas
 
-    def forward(self, x):
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
-        return x  # [N, hidden_dim, Ot, Od, Oh, Ow]
+def box_iou_4d(a, b):
+    # both: [8] -> IoU scalar
+    t1,d1,h1,w1,t2,d2,h2,w2 = a; T1,D1,H1,W1,T2,D2,H2,W2 = b
+    i_t1, i_d1, i_h1, i_w1 = max(t1,T1), max(d1,D1), max(h1,H1), max(w1,W1)
+    i_t2, i_d2, i_h2, i_w2 = min(t2,T2), min(d2,D2), min(h2,H2), min(w2,W2)
+    if i_t2<=i_t1 or i_d2<=i_d1 or i_h2<=i_h1 or i_w2<=i_w1:
+        return 0.0
+    inter = (i_t2-i_t1)*(i_d2-i_d1)*(i_h2-i_h1)*(i_w2-i_w1)
+    volA = (t2-t1)*(d2-d1)*(h2-h1)*(w2-w1)
+    volB = (T2-T1)*(D2-D1)*(H2-H1)*(W2-W1)
+    return inter / (volA + volB - inter + 1e-6)
 
-class MaskPredictor4D(nn.Module):
-    """
-    Projects to per‐class mask logits at the pooled resolution.
-    """
-    def __init__(self, in_channels, num_classes):
-        super().__init__()
-        self.mask_fcn = Conv4d(in_channels, num_classes, kernel_size=1)
-
-    def forward(self, x):
-        return self.mask_fcn(x)  # [N, num_classes, Ot, Od, Oh, Ow]
-
-# -----------------------------------------------------------------------------
-# 5) 4D RoI Heads tying it all together
-# -----------------------------------------------------------------------------
-class RoIHeads4D(nn.Module):
-    def __init__(self,
-                 out_channels,            # C
-                 box_output_size,         # (Ot,Od,Oh,Ow)
-                 mask_output_size,        # (Ot,Od,Oh,Ow)
-                 num_classes):
-        super().__init__()
-        OtB,OdB,OhB,OwB = box_output_size
-        OtM,OdM,OhM,OwM = mask_output_size
-
-        self.box_roi_pool = ROIAlign4D(box_output_size)
-        self.box_head     = BoxHead4D(out_channels, *box_output_size)
-        self.box_predictor = BoxPredictor4D(self.box_head.fc2.out_features, num_classes)
-
-        self.mask_roi_pool = ROIAlign4D(mask_output_size)
-        self.mask_head     = MaskHead4D(out_channels)
-        self.mask_predictor= MaskPredictor4D(128, num_classes)
-
-    def forward(self, features, proposals, image_shapes, targets=None):
-        """
-        features: [B,C,T,D,H,W]
-        proposals: list of length B, each Tensor[K,8] with boxes in feature-map coords
-        """
-        # 1) Box branch
-        pooled_boxes = self.box_roi_pool(features, proposals)      # [N,C,OtB,OdB,OhB,OwB]
-        box_feats    = self.box_head(pooled_boxes)                # [N,rep]
-        class_logits, box_deltas = self.box_predictor(box_feats)  # [N,cls], [N,cls*8]
-
-        # Compute box losses or detections here (omitted for brevity)...
-        # 2) Mask branch (only on positive RoIs in training/inference)
-        pooled_masks = self.mask_roi_pool(features, proposals)     # [N,C,OtM,OdM,OhM,OwM]
-        mask_feats   = self.mask_head(pooled_masks)               # [N,128,OtM,OdM,OhM,OwM]
-        mask_logits  = self.mask_predictor(mask_feats)            # [N,cls,OtM,OdM,OhM,OwM]
-
-        # Return raw outputs; a full implementation would compute:
-        #   - classification + box regression losses
-        #   - mask loss
-        #   - final detections & masks in 4D
-        return {
-            "class_logits": class_logits,
-            "box_deltas": box_deltas,
-            "mask_logits": mask_logits
-        }
+def nms_4d(boxes, scores, iou_threshold):
+    idxs = scores.argsort(descending=True)
+    keep = []
+    while idxs.numel() > 0:
+        i = idxs[0].item(); keep.append(i)
+        if idxs.numel()==1: break
+        rest = idxs[1:]
+        ious = torch.tensor([box_iou_4d(boxes[i], boxes[j]) for j in rest], device=boxes.device)
+        idxs = rest[ious<=iou_threshold]
+    return keep
 
 # -----------------------------------------------------------------------------
-# 6) Full 4D MaskRCNN
+# 5) 4-D RPN & Proposal Generation
 # -----------------------------------------------------------------------------
-class MaskRCNN4D(nn.Module):
-    def __init__(self,
-                 backbone4d,            # e.g. your Polyp-PVT 4D encoder + FPN
-                 num_classes,
-                 anchor_sizes=((8,), (16,), (32,), (64,)),
-                 aspect_ratios=((1.0,),)*4,
-                 box_output_size=(2,2,7,7),
-                 mask_output_size=(2,2,14,14)):
-        super().__init__()
-        # 1) backbone + FPN
-        self.body = backbone4d
-        in_channels_list = [backbone4d.out_channels]*4
-        self.fpn = FeaturePyramidNetwork(in_channels_list, backbone4d.out_channels)
-        self.out_channels = backbone4d.out_channels
+def rpn_4d(anchor_gen, rpn_head, features, strides, pre_nms_top_n=1000, nms_thresh=0.7):
+    # features: OrderedDict level->[B,C,T,D,H,W]
+    batch_size = next(iter(features.values())).shape[0]
+    all_anchors = []
+    obj_logits = []
+    bbox_deltas = []
+    for lvl, feat in features.items():
+        stride = strides[lvl]
+        anchors = anchor_gen.grid_anchors(feat.shape[-4:], torch.tensor(stride, device=feat.device))
+        anchors = anchors.unsqueeze(0).repeat(batch_size,1,1)  # [B,N,8]
+        logits, deltas = rpn_head(feat)
+        B,A,T,D,H,W = logits.shape
+        logits = logits.permute(0,1,2,3,4,5).reshape(B, -1)
+        deltas = deltas.permute(0,1,2,3,4,5).reshape(B, -1, 8)
+        all_anchors.append(anchors)
+        obj_logits.append(logits)
+        bbox_deltas.append(deltas)
+    all_anchors = torch.cat(all_anchors, dim=1)   # [B, M,8]
+    obj_logits  = torch.cat(obj_logits, dim=1)    # [B, M]
+    bbox_deltas = torch.cat(bbox_deltas, dim=1)   # [B, M,8]
 
-        # 2) RPN
-        self.anchor_generator = AnchorGenerator(sizes=anchor_sizes,
-                                                aspect_ratios=aspect_ratios)
-        # ... (build your RPN here, omitted for brevity)
-
-        # 3) 4D RoI Heads
-        self.roi_heads = RoIHeads4D(self.out_channels,
-                                    box_output_size,
-                                    mask_output_size,
-                                    num_classes)
-
-    def forward(self, x, targets=None):
-        # x: list of 4D tensors [B, C_in, T, D, H, W]
-        features = self.body(x[0])               # OrderedDict of 4D maps p2..p5
-        features = self.fpn(features)            # same keys
-        # 4) RPN to generate 4D proposals (omitted; produce list of B [K,8] tensors)
-        proposals = rpn_4d(self.anchor_generator, features, x)  # you’d implement this
-        # 5) RoI heads
-        return self.roi_heads(features_to_tensor(features),
-                              proposals, image_shapes=None, targets=targets)
+    proposals = []
+    for b in range(batch_size):
+        scores = obj_logits[b].sigmoid()
+        deltas = bbox_deltas[b]
+        anchors = all_anchors[b]
+        # top-k
+        num_ = min(pre_nms_top_n, scores.size(0))
+        topk = scores.topk(num_, sorted=True)
+        idx = topk.indices
+        anchors_t = anchors[idx]
+        deltas_t  = deltas[idx]
+        scores_t  = scores[idx]
+        # decode
+        props = apply_4d_deltas(anchors_t, deltas_t)
+        # NMS
+        keep = nms_4d(props, scores_t, nms_thresh)
+        proposals.append(props[keep])
+    return proposals  # list of [K,8]
 
 # -----------------------------------------------------------------------------
-# NOTE
-#  - You’ll need to implement `rpn_4d` to produce 4D box proposals.
-#  - `features_to_tensor` should stack your OrderedDict levels into one 4D tensor
-#    or pass them separately to `ROIAlign4D`.
-#  - Loss/detection post-processing are left as an exercise.
+# 6) Post-processing predictions
+# -----------------------------------------------------------------------------
+def postprocess_detections_4d(class_logits, box_deltas, mask_logits, proposals, score_thresh=0.5, iou_thresh=0.5):
+    # class_logits: [N,cls], box_deltas: [N,cls*8], mask_logits: [N,cls,Ot,Od,Oh,Ow]
+    device = class_logits.device
+    N, C = class_logits.shape
+    num_classes = C
+    results = []
+    scores = F.softmax(class_logits, -1)
+    for cls in range(1, num_classes):
+        cls_scores = scores[:, cls]
+        keep = cls_scores > score_thresh
+        if keep.sum()==0: continue
+        cls_boxes  = box_deltas.view(N, num_classes,8)[keep, cls]
+        cls_scores = cls_scores[keep]
+        cls_masks  = mask_logits[keep, cls]  # [M,Ot,Od,Oh,Ow]
+        # apply deltas to proposals
+        idxs = keep.nonzero().view(-1)
+        props = proposals[idxs]
+        boxes = apply_4d_deltas(props, cls_boxes)
+        # nms
+        keep2 = nms_4d(boxes, cls_scores, iou_thresh)
+        for i in keep2:
+            mask = cls_masks[i].sigmoid() > 0.5
+            results.append({
+                "class": cls,
+                "score": cls_scores[i].item(),
+                "box4d": boxes[i].tolist(),
+                "mask4d": mask.cpu().numpy()
+            })
+    return results
+
+# -----------------------------------------------------------------------------
+# Usage within MaskRCNN4D:
+#   proposals = rpn_4d(anchor_gen, rpn_head, features, strides)
+#   detections = postprocess_detections_4d(...)
 # -----------------------------------------------------------------------------
